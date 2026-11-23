@@ -1,7 +1,7 @@
 [Setup]
 AppName=Channel Soundboard
 AppPublisher=Balram Sevak
-AppVersion=8.0
+AppVersion=11.0
 DefaultDirName={autopf}\ChannelSoundboard
 DefaultGroupName=Channel Soundboard
 OutputDir=installer

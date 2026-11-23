@@ -17,7 +17,9 @@ class Master:
 
 
 class Cfg:
-    fade = 1.2                # seconds of fade in / crossfade (0 = off)
+    fade = 1.2                # seconds of fade in / fade out (0 = off)
+    xf = 3.0                  # crossfade between songs in Continue (0 = gapless)
+    duck = 0.35               # song level while a clip plays
 
 
 OPEN = set()                # channels that currently own an open output stream
@@ -164,6 +166,10 @@ class Chan:
         self.fxver, self.sos, self.zi = -1, None, None
         self.is_cue, self.cue = False, None            # cue = hidden pre-listen copy of this song that plays in the headset
         self.idle_t = time.time()
+        self.pg, self.only = 1, False                  # page id; only=True: Continue / Shuffle skip this song (it plays at its own time)
+        self.clips, self.clips_on = [], False          # clips: [{path, name, at, pd}] play at 'at' seconds of this song
+        self.cp, self.cp_held, self.xfd, self.nx = None, False, False, None
+        self._lp, self._duck, self.duck_t = 0.0, 1.0, 1.0
 
     def _mk_filters(self):
         self.fxver = Fx.ver
@@ -247,7 +253,8 @@ class Chan:
             self.gain = ng
         else:
             ramp = g
-        out[:n] = np.clip(d * ramp * (Master.cue if self.is_cue else (0.0 if self.mute else self.vol) * Master.v), -1.0, 1.0)
+        self._duck += (self.duck_t - self._duck) * min(1.0, n / (0.2 * self.sr))
+        out[:n] = np.clip(d * ramp * (Master.cue if self.is_cue else (0.0 if self.mute else self.vol) * Master.v * self._duck), -1.0, 1.0)
         self.played = min(self.dur or 1e9, self.played + n / self.sr)
         if n < frames:
             out[n:] = 0
@@ -264,7 +271,7 @@ class Chan:
         self.ensure_stream()
         if restart:
             self.seek(0)
-        self.ended = False
+        self.ended = self.xfd = False
         self.gstep = 1.0 / (max(fade, 0.01) * self.sr)
         self.gtarget, self.playing = 1.0, True
 
@@ -285,3 +292,60 @@ class Chan:
         self.open()
         with self.lock:
             self.sf.seek(int(max(0, min(sec * self.sr, self.total - 1))))
+
+
+class ClipPlayer:
+    """One short clip (dialogue) on an output device. It can pause, resume and stop, and it ignores the song's mute."""
+    def __init__(self, path, dev=None, head=False):
+        self.path, self.dev, self.head = path, dev, head
+        self.paused = self.done = False
+        self.sf = self.stream = None
+        self.lock = threading.Lock()
+
+    def start(self):
+        self.sf = sf.SoundFile(self.path)
+        idx, extra = resolve(self.dev), None
+        try:
+            w = wasapi_index()
+            if w is not None and idx is not None and sd.query_devices(idx)["hostapi"] == w:
+                extra = sd.WasapiSettings(auto_convert=True)
+        except Exception:
+            pass
+        self.stream = sd.OutputStream(samplerate=self.sf.samplerate, device=idx, channels=2, dtype="float32",
+                                      latency="high", callback=self._cb, extra_settings=extra)
+        self.stream.start()
+
+    def _cb(self, out, frames, t, status):
+        with self.lock:
+            if self.paused or self.done or self.sf is None:
+                out.fill(0)
+                return
+            d = self.sf.read(frames, dtype="float32", always_2d=True)
+        n = len(d)
+        if d.shape[1] == 1:
+            d = np.repeat(d, 2, axis=1)
+        elif d.shape[1] > 2:
+            d = d[:, :2]
+        out[:n] = np.clip(d * (Master.cue if self.head else Master.v), -1.0, 1.0)
+        if n < frames:
+            out[n:] = 0
+            self.done = True
+
+    def pause(self): self.paused = True
+    def resume(self): self.paused = False
+
+    def stop(self):
+        self.done = True
+        s, self.stream = self.stream, None
+        if s:
+            try:
+                s.abort(); s.close()
+            except Exception:
+                pass
+        with self.lock:
+            if self.sf:
+                try:
+                    self.sf.close()
+                except Exception:
+                    pass
+                self.sf = None
